@@ -339,20 +339,26 @@ class SnapshotAdminForm(forms.ModelForm):
     def save(self, commit=True):
         instance = super().save(commit=False)
         permissions = self.cleaned_data["permissions_config"]
-        config = dict(instance.config or {})
-        config["PERMISSIONS"] = permissions
-        instance.config = config
 
-        # Handle tags_editor field
-        if commit:
-            instance.save()
-            self._save_m2m()
+        if not commit:
+            config = dict(instance.config or {})
+            config["PERMISSIONS"] = permissions
+            instance.config = config
+            return instance
 
-            # Parse and save tags from tags_editor
-            tags_str = self.cleaned_data.get("tags_editor", "")
-            tag_names = [name.strip() for name in tags_str.split(",") if name.strip()]
-            instance.save_tags(tag_names)
+        instance.save()
+        self._save_m2m()
 
+        # Parse and save tags from tags_editor
+        tags_str = self.cleaned_data.get("tags_editor", "")
+        tag_names = [name.strip() for name in tags_str.split(",") if name.strip()]
+        instance.save_tags(tag_names)
+
+        # Route the visibility choice through the same versioned publication
+        # as the quick menu (choosing the crawl default clears the override).
+        from archivebox.services.permission_service import publish_snapshot_permissions
+
+        publish_snapshot_permissions([instance], permissions)
         return instance
 
 
@@ -636,14 +642,12 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
             return HttpResponseBadRequest("Invalid permissions value")
 
         snapshot = get_object_or_404(Snapshot, pk=object_id)
-        config = dict(snapshot.config or {})
-        config["PERMISSIONS"] = permissions
+        from archivebox.services.permission_service import publish_snapshot_permissions
 
-        # Keep the quick-edit write to one targeted UPDATE so SQLite only holds
-        # the write lock for the permission/config change itself. safe_update()
-        # keeps this from overwriting a concurrent admin/runner edit to the
-        # same Snapshot after the row was loaded above.
-        snapshot.safe_update({"config": config, "modified_at": timezone.now()}, refresh=False)
+        # Explicit quick-edit is a single-snapshot publication: it versions
+        # the row, rotates replay grants, and rewrites static metadata through
+        # the resumable orchestrator job.
+        publish_snapshot_permissions([snapshot], permissions, user=request.user)
         icon, label, fg, bg = SNAPSHOT_PERMISSION_META[permissions]
         return JsonResponse({"permissions": permissions, "icon": icon, "label": label, "fg": fg, "bg": bg})
 
@@ -653,28 +657,17 @@ class SnapshotAdmin(SearchResultsAdminMixin, ConfigEditorMixin, BaseModelAdmin):
         if permissions not in dict(PERMISSIONS_CHOICES):
             messages.error(request, "Choose a valid permissions value.")
             return
-        updated = self.update_snapshot_permissions(queryset, permissions)
+        updated = self.update_snapshot_permissions(queryset, permissions, request=request)
         messages.success(request, f"Set permissions to {permissions} on {updated} snapshot(s).")
 
-    def update_snapshot_permissions(self, queryset, permissions):
-        now = timezone.now()
-        updated = 0
-        batch = []
-        snapshots = queryset.select_related(None).only("id", "config").prefetch_related(None)
-        for snapshot in snapshots.iterator(chunk_size=500):
-            config = dict(snapshot.config or {})
-            config["PERMISSIONS"] = permissions
-            snapshot.config = config
-            snapshot.modified_at = now
-            batch.append(snapshot)
-            if len(batch) >= 500:
-                Snapshot.objects.bulk_update(batch, ["config", "modified_at"], batch_size=500)
-                updated += len(batch)
-                batch.clear()
-        if batch:
-            Snapshot.objects.bulk_update(batch, ["config", "modified_at"], batch_size=500)
-            updated += len(batch)
-        return updated
+    def update_snapshot_permissions(self, queryset, permissions, *, request=None):
+        from archivebox.services.permission_service import publish_snapshot_permissions
+
+        # One durable publication per explicit snapshot edit; the service
+        # marks the override flag so later crawl publications cannot revert.
+        snapshots = list(queryset.select_related(None).only("id").prefetch_related(None))
+        publications = publish_snapshot_permissions(snapshots, permissions, user=getattr(request, "user", None))
+        return len(publications)
 
     def redo_failed_view(self, request, object_id):
         snapshot = get_object_or_404(Snapshot, pk=object_id)

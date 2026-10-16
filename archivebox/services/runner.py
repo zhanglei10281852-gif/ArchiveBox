@@ -2270,6 +2270,7 @@ def run_pending_crawls(
     last_recovery_at = 0.0
     last_retention_at = 0.0
     last_retention_repair_at = 0.0
+    last_permission_publish_at = 0.0
     retention_backfill_cursors: dict = {}
     deletion_thread: threading.Thread | None = None
     last_analyze_at = 0.0
@@ -2482,6 +2483,16 @@ def run_pending_crawls(
                 continue
 
         now_monotonic = time.monotonic()
+        if crawl_id is None and now_monotonic - last_permission_publish_at >= (30.0 if daemon else 0.0):
+            # Finish pending permission publications (child rows + static
+            # JSON/HTML manifests). Resumable and idempotent, so daemon sweeps
+            # and one-off `archivebox run` passes both converge interrupted
+            # jobs instead of leaving mixed permissions.
+            from archivebox.services.permission_service import advance_pending_publishes
+
+            advance_pending_publishes(max_snapshots=100)
+            last_permission_publish_at = now_monotonic
+
         if crawl_id is None and now_monotonic - last_retention_repair_at >= (60.0 if daemon else 0.0):
             for model in (ArchiveResult, Snapshot, Crawl, Process):
                 # No runnable work was found on this scheduler pass. This is

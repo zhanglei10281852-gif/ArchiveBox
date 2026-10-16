@@ -39,6 +39,30 @@ if TYPE_CHECKING:
     from archivebox.core.models import Snapshot
 
 
+def _request_permission_publication_for_crawl(
+    *,
+    crawl_id,
+    old_permissions: str | None,
+    old_permissions_version: int,
+    new_permissions: str | None,
+):
+    """Post-commit hook: turn a committed crawl intent change into a publication.
+
+    Imported lazily so the crawls app never imports the services layer at
+    module load. The service compare-and-swaps the version against the value
+    observed by save(); a concurrent admin action that already advanced it
+    wins and this call becomes a no-op.
+    """
+    from archivebox.services.permission_service import handle_committed_crawl_permission_change
+
+    return handle_committed_crawl_permission_change(
+        crawl_id=crawl_id,
+        old_permissions=old_permissions,
+        old_permissions_version=old_permissions_version,
+        new_permissions=new_permissions,
+    )
+
+
 class CrawlSchedule(ModelWithUUID, ModelWithNotes):
     id = CompactUUIDField(primary_key=True, default=uuid7, editable=False, unique=True)
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
@@ -160,6 +184,12 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
         db_persist=True,
         db_index=True,
         editable=False,
+    )
+    permissions_version = models.PositiveIntegerField(
+        default=1,
+        db_default=1,
+        editable=False,
+        help_text="Version of the current PERMISSIONS intent; bumped whenever visibility changes.",
     )
     max_depth = models.PositiveSmallIntegerField(default=0, validators=[MinValueValidator(0), MaxValueValidator(4)])
     tags_str = models.CharField(max_length=1024, blank=True, null=False, default="")
@@ -313,6 +343,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             # their own tags; bulk admin actions handle explicit retroactive edits.
             self.tags_str = ",".join(self.parse_tag_names(self.tags_str or ""))
         old_crawl = type(self).objects.filter(pk=self.pk).first() if self.pk else None
+        old_permissions_version = getattr(old_crawl, "permissions_version", 1) or 1
 
         from archivebox.config.common import ArchiveBoxConfig, build_crawl_config_snapshot
 
@@ -343,30 +374,18 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
         super().save(*args, **kwargs)
         old_permissions = getattr(old_crawl, "permissions", None)
         if old_crawl is not None and old_permissions != self.permissions:
-            transaction.on_commit(lambda: self.update_child_snapshot_permissions(old_permissions, self.permissions))
-
-    def update_child_snapshot_permissions(self, old_permissions: str | None, new_permissions: str | None) -> int:
-        from archivebox.core.models import Snapshot
-
-        normalized_new_permissions = normalize_permissions(new_permissions)
-        now = timezone.now()
-        batch = []
-        updated = 0
-        queryset = self.snapshot_set.filter(Q(permissions=old_permissions) | Q(permissions__isnull=True)).only("id", "config")
-        for snapshot in queryset.order_by("pk").paged_iterator(chunk_size=500):
-            config = dict(snapshot.config or {})
-            config["PERMISSIONS"] = normalized_new_permissions
-            snapshot.config = config
-            snapshot.modified_at = now
-            batch.append(snapshot)
-            if len(batch) >= 500:
-                Snapshot.objects.bulk_update(batch, ["config", "modified_at"], batch_size=500)
-                updated += len(batch)
-                batch.clear()
-        if batch:
-            Snapshot.objects.bulk_update(batch, ["config", "modified_at"], batch_size=500)
-            updated += len(batch)
-        return updated
+            # The visibility change is a durable, versioned publication: the
+            # intent row is live now (surfaces fail closed on tightening), and
+            # child rows/static metadata/replay grants converge under the
+            # orchestrator's resumable publication job.
+            transaction.on_commit(
+                lambda: _request_permission_publication_for_crawl(
+                    crawl_id=self.pk,
+                    old_permissions=old_permissions,
+                    old_permissions_version=old_permissions_version,
+                    new_permissions=self.permissions,
+                )
+            )
 
     @property
     def api_url(self) -> str:
@@ -408,6 +427,8 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             "urls": self.urls,
             "status": self.status,
             "max_depth": self.max_depth,
+            "permissions": self.permissions,
+            "permissions_version": self.permissions_version,
             "config": redact_sensitive_config(self.config),
             "tags_str": self.tags_str,
             "label": self.label,

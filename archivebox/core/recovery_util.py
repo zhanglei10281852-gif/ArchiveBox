@@ -26,7 +26,19 @@ def recover_orchestrator_state(*, include_chrome: bool = False, crawl_id: str | 
         "crawls_started_with_due_snapshots": 0,
         "crawls_started_waiting_on_future_snapshots": 0,
         "crawls_started_without_active_snapshots": 0,
+        "permission_publishes_interrupted": 0,
     }
+
+    # Permission publications are durable jobs: a RUNNING row left by a
+    # killed orchestrator must resume from its cursor instead of leaving the
+    # collection with permanently mixed child permissions/metadata.
+    from archivebox.core.models import PermissionPublish
+
+    permission_publish_filter = {"crawl_id": crawl_id} if crawl_id else {}
+    cleaned["permission_publishes_interrupted"] = PermissionPublish.objects.filter(
+        status=PermissionPublish.StatusChoices.RUNNING,
+        **permission_publish_filter,
+    ).update(status=PermissionPublish.StatusChoices.PENDING, modified_at=now)
 
     running_hook_processes = Process.objects.filter(
         archiveresult__snapshot_id=OuterRef("pk"),

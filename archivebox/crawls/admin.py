@@ -939,31 +939,20 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
         if permissions not in PERMISSIONS_VALUES:
             messages.error(request, "Choose a valid permissions value.")
             return
-        updated = self.update_crawl_permissions(queryset, permissions)
+        updated = self.update_crawl_permissions(queryset, permissions, request=request)
         messages.success(request, f"Set permissions to {permissions} on {updated} crawl(s).")
 
-    def update_crawl_permissions(self, queryset, permissions):
-        now = timezone.now()
+    def update_crawl_permissions(self, queryset, permissions, *, request=None):
+        # Visibility changes are versioned publications: the service bumps
+        # the crawl intent and drives the resumable child/static/replay
+        # convergence. Never bulk-write config here without publishing.
+        from archivebox.services.permission_service import publish_crawl_permissions
+
+        user = getattr(request, "user", None)
         updated = 0
-        batch = []
-        crawls_to_update = []
-        for crawl in queryset.only("id", "config", "permissions").order_by("pk").paged_iterator(chunk_size=500):
-            old_permissions = crawl.permissions
-            config = dict(crawl.config or {})
-            config["PERMISSIONS"] = permissions
-            crawl.config = config
-            crawl.modified_at = now
-            crawls_to_update.append((crawl, old_permissions))
-            batch.append(crawl)
-            if len(batch) >= 500:
-                Crawl.objects.bulk_update(batch, ["config", "modified_at"], batch_size=500)
-                updated += len(batch)
-                batch.clear()
-        if batch:
-            Crawl.objects.bulk_update(batch, ["config", "modified_at"], batch_size=500)
-            updated += len(batch)
-        for crawl, old_permissions in crawls_to_update:
-            crawl.update_child_snapshot_permissions(old_permissions, permissions)
+        for crawl in queryset.only("id").order_by("pk").paged_iterator(chunk_size=500):
+            if publish_crawl_permissions(crawl, permissions, user=user) is not None:
+                updated += 1
         return updated
 
     @action(label="Recrawl", description="Create a new crawl with the same settings", methods=("POST",))
@@ -1192,7 +1181,7 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
             return HttpResponseBadRequest("Invalid permissions value")
 
         crawl = get_object_or_404(Crawl, pk=object_id)
-        self.update_crawl_permissions(Crawl.objects.filter(pk=crawl.pk), permissions)
+        self.update_crawl_permissions(Crawl.objects.filter(pk=crawl.pk), permissions, request=request)
         icon, label, fg, bg = PERMISSIONS_META[permissions]
         return JsonResponse({"permissions": permissions, "icon": icon, "label": label, "fg": fg, "bg": bg})
 

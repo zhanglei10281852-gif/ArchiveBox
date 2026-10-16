@@ -57,9 +57,11 @@ from archivebox.core.permissions import (
     PERMISSIONS_UNLISTED,
     can_view_snapshot,
     direct_snapshots_queryset,
+    effective_snapshot_permissions,
     filter_personas_by_permissions,
     is_admin_user,
     public_snapshots_queryset,
+    snapshot_replay_epoch,
 )
 from archivebox.core.routes_util import (
     build_admin_url,
@@ -168,7 +170,9 @@ def _admin_login_redirect_or_forbidden(request: HttpRequest):
     return HttpResponseForbidden("ArchiveBox is running with the control plane disabled in this security mode.")
 
 
-REPLAY_AUTH_SALT = "archivebox.private-snapshot-replay.v2"
+# v3 embeds the permission epoch: any crawl/snapshot visibility publication
+# rotates the epoch and invalidates every previously minted replay grant/cookie.
+REPLAY_AUTH_SALT = "archivebox.private-snapshot-replay.v3"
 # WHY: grants travel in URLs (history, proxy logs) and must expire after
 # REPLAY_GRANT_MAX_AGE. A distinct salt stops a captured grant from being
 # presented directly as the long-lived replay cookie.
@@ -201,13 +205,27 @@ def _replay_payload_is_valid(payload: dict, snapshot: Snapshot) -> bool:
     session still belongs to an active staff user.
     Logout, session expiry, user deletion/deactivation, or password auth-hash rotation all
     make the replay cookie inert without needing admin.* to delete a cookie on snap-*.
+    A parent Crawl or single-snapshot permission publication rotates the replay epoch,
+    so grants handed out before a tightening are rejected even while both sessions are
+    still alive (no mixed-permission window after the list/detail gates have closed).
     """
     if payload.get("snapshot_id") != str(snapshot.id):
+        return False
+    current_epoch = snapshot_replay_epoch(snapshot)
+    try:
+        payload_epoch = int(payload.get("perm_epoch") or 0)
+    except (TypeError, ValueError):
+        return False
+    if payload_epoch != current_epoch:
         return False
     try:
         replay_session = Session.objects.get(session_key=str(payload.get("replay_session") or ""), expire_date__gt=timezone.now())
         replay = replay_session.get_decoded().get("replay")
         if not isinstance(replay, dict) or replay.get("snapshot_id") != str(snapshot.id):
+            return False
+        # The signed cookie alone can never promote itself: the server-side
+        # replay row must have been minted at the same current epoch.
+        if int(replay.get("perm_epoch") or 0) != current_epoch:
             return False
         session = Session.objects.get(session_key=str(replay.get("session_key") or ""), expire_date__gt=timezone.now())
         session_data = session.get_decoded()
@@ -289,16 +307,22 @@ class SnapshotReplayAuthView(View):
         # Signed JSON is readable, not encrypted. Store the privileged session
         # reference only server-side; replay credentials carry an opaque key to
         # this separate row, which deliberately has no Django auth session keys.
+        epoch = snapshot_replay_epoch(snapshot)
         replay_session = SessionStore()
         replay_session["replay"] = {
             "snapshot_id": str(snapshot.id),
             "user_id": str(request.user.pk),
             "session_key": request.session.session_key,
             "auth_hash": request.user.get_session_auth_hash(),
+            "perm_epoch": epoch,
         }
         replay_session.set_expiry(request.session.get_expiry_date())
         replay_session.create()
-        payload = {"snapshot_id": str(snapshot.id), "replay_session": replay_session.session_key}
+        payload = {
+            "snapshot_id": str(snapshot.id),
+            "replay_session": replay_session.session_key,
+            "perm_epoch": epoch,
+        }
         grant = signing.dumps(payload, salt=REPLAY_GRANT_SALT)
         next_path = _clean_replay_next(request.GET.get("next"))
         target = build_snapshot_url(str(snapshot.id), "_auth", request=request, config=get_request_config(request))
@@ -405,7 +429,7 @@ class SnapshotView(View):
             response = render(request, "core/snapshot_output_cards.html", context)
             patch_cache_control(response, private=True, no_store=True)
             return response
-        request.archivebox_cache_policy = "public" if snapshot.permissions == PERMISSIONS_PUBLIC else "private"
+        request.archivebox_cache_policy = "public" if effective_snapshot_permissions(snapshot) == PERMISSIONS_PUBLIC else "private"
         response = render(
             template_name="core/snapshot.html",
             request=request,
@@ -428,7 +452,7 @@ class SnapshotView(View):
             try:
                 try:
                     snapshot = Snapshot.objects.get(Q(timestamp=slug) | Q(id__startswith=slug))
-                    request.archivebox_cache_policy = "public" if snapshot.permissions == PERMISSIONS_PUBLIC else "private"
+                    request.archivebox_cache_policy = "public" if effective_snapshot_permissions(snapshot) == PERMISSIONS_PUBLIC else "private"
                     if not can_view_snapshot(request, snapshot):
                         return _private_snapshot_auth_redirect(request, snapshot, archivefile or "index.html")
                     canonical_base = snapshot.url_path
@@ -719,7 +743,7 @@ class SnapshotPathView(View):
                 status=404,
             )
 
-        request.archivebox_cache_policy = "public" if snapshot.permissions == PERMISSIONS_PUBLIC else "private"
+        request.archivebox_cache_policy = "public" if effective_snapshot_permissions(snapshot) == PERMISSIONS_PUBLIC else "private"
         canonical_base = snapshot.url_path
         if date:
             requested_base = f"{username}/{date}/{domain or url or ''}"
@@ -1083,7 +1107,7 @@ def _build_snapshot_replay_response(request: HttpRequest, snapshot: Snapshot, pa
     )
     request.archivebox_config = request_config
     request.archivebox_snapshot_url = snapshot.url
-    request.archivebox_cache_policy = "public" if snapshot.permissions == PERMISSIONS_PUBLIC else "private"
+    request.archivebox_cache_policy = "public" if effective_snapshot_permissions(snapshot) == PERMISSIONS_PUBLIC else "private"
     snapshot._runtime_config = request_config
 
     if rel_path.startswith("replay/") or rel_path == "replay":
@@ -1175,9 +1199,9 @@ def _serve_snapshot_replay(request: HttpRequest, snapshot: Snapshot, path: str =
         return response
     if path != "progress.json" and response.status_code in (200, 206, 304):
         if not response.get("Cache-Control"):
-            policy = "public" if snapshot.permissions == PERMISSIONS_PUBLIC else "private"
+            policy = "public" if effective_snapshot_permissions(snapshot) == PERMISSIONS_PUBLIC else "private"
             response.headers["Cache-Control"] = f"{policy}, max-age=60, stale-while-revalidate=300"
-        if snapshot.permissions != PERMISSIONS_PUBLIC:
+        if effective_snapshot_permissions(snapshot) != PERMISSIONS_PUBLIC:
             patch_cache_control(response, private=True)
     else:
         response.headers["Cache-Control"] = "private, no-store"
@@ -1209,7 +1233,7 @@ def _serve_original_domain_replay(request: HttpRequest, domain: str, path: str =
     root_match = (match[0], match[1]) if match else _latest_responses_root(snapshots, domain)
     responses_root = root_match[1] if root_match else None
     if root_match:
-        request.archivebox_cache_policy = "public" if root_match[0].permissions == PERMISSIONS_PUBLIC else "private"
+        request.archivebox_cache_policy = "public" if effective_snapshot_permissions(root_match[0]) == PERMISSIONS_PUBLIC else "private"
     if request_config.USES_SUBDOMAIN_ROUTING:
         snapshot = root_match[0] if root_match else (snapshots[0] if requested_root_index and snapshots else None)
         if snapshot:
@@ -1350,13 +1374,16 @@ class PublicIndexView(ListView):
         # OFFSET must stay ID-only: wide columns and owner joins would also be
         # computed for every skipped row.
         start = (page_number - 1) * page_size
+        # The walk and the row re-check both use the *effective* permission:
+        # a lagging child row during a crawl tightening must leave the public
+        # list in the same transaction that closes its direct links.
         page_ids = list(
-            Snapshot.objects.filter(config__PERMISSIONS=PERMISSIONS_PUBLIC)
+            public_snapshots_queryset(Snapshot.objects.all())
             .order_by(*self.ordering, "id")
             .values_list("id", flat=True)[start : start + page_size + 1],
         )
         return list(
-            Snapshot.objects.filter(pk__in=page_ids, permissions=PERMISSIONS_PUBLIC)
+            public_snapshots_queryset(Snapshot.objects.filter(pk__in=page_ids))
             .select_related("crawl__created_by")
             .order_by(*self.ordering, "id")
             .only(*self._base_public_snapshot_fields()),

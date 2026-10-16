@@ -200,30 +200,44 @@ class SnapshotQuerySet(PagedQuerySet):
 
     def bulk_create(self, objs, *args, **kwargs):
         objs = list(objs)
-        missing_crawl_ids = set()
+        crawl_ids = set()
         from archivebox.core.permissions import PERMISSIONS_VALUES
 
         for obj in objs:
-            if isinstance(obj, self.model):
+            if isinstance(obj, self.model) and obj.crawl_id:
                 config = dict(obj.config or {})
                 permission = str(config.get("PERMISSIONS") or "").strip().lower()
-                if permission not in PERMISSIONS_VALUES and obj.crawl_id:
-                    crawl = getattr(obj, "crawl", None)
-                    if not getattr(crawl, "permissions", None):
-                        missing_crawl_ids.add(str(obj.crawl_id))
+                crawl = getattr(obj, "crawl", None)
+                # Resolve the parent intent from the database unless the
+                # caller supplied the full crawl object with both fields.
+                if permission not in PERMISSIONS_VALUES or getattr(crawl, "permissions_version", None) is None:
+                    crawl_ids.add(str(obj.crawl_id))
 
         crawl_permissions_by_id = {}
-        if missing_crawl_ids:
+        if crawl_ids:
             crawl_permissions_by_id = {
-                str(crawl_id): permissions
-                for crawl_id, permissions in Crawl.objects.filter(pk__in=missing_crawl_ids).values_list("pk", "permissions")
+                str(crawl_id): (permissions, permissions_version)
+                for crawl_id, permissions, permissions_version in Crawl.objects.filter(pk__in=crawl_ids).values_list(
+                    "pk",
+                    "permissions",
+                    "permissions_version",
+                )
             }
 
         from archivebox.misc.db import truncate_overlong_charfields
 
         for obj in objs:
             if isinstance(obj, self.model):
-                obj.ensure_permissions_config(crawl_permissions=crawl_permissions_by_id.get(str(obj.crawl_id)))
+                crawl = getattr(obj, "crawl", None)
+                if str(obj.crawl_id) in crawl_permissions_by_id:
+                    crawl_permissions, crawl_permissions_version = crawl_permissions_by_id[str(obj.crawl_id)]
+                else:
+                    crawl_permissions = getattr(crawl, "permissions", None)
+                    crawl_permissions_version = getattr(crawl, "permissions_version", None)
+                obj.ensure_permissions_config(
+                    crawl_permissions=crawl_permissions,
+                    crawl_permissions_version=crawl_permissions_version,
+                )
                 # bulk_create bypasses pre_save, so clamp CharFields here too
                 # (e.g. page titles) to stay within postgres VARCHAR limits.
                 truncate_overlong_charfields(obj)
@@ -513,6 +527,19 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
         db_persist=True,
         db_index=True,
         editable=False,
+    )
+    permissions_version = models.PositiveIntegerField(
+        default=1,
+        db_default=1,
+        editable=False,
+        help_text="Version of the permission intent this row currently carries (crawl version when inherited).",
+    )
+    permissions_override = models.BooleanField(
+        default=False,
+        db_default=False,
+        editable=False,
+        db_index=True,
+        help_text="Set when an admin explicitly changed this snapshot's visibility; parent publications skip it.",
     )
     output_size = models.BigIntegerField(
         default=0,
@@ -985,25 +1012,58 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
 
         return Binary.objects.filter(process_set__archiveresult__snapshot_id=self.id).distinct()
 
-    def ensure_permissions_config(self, crawl_permissions: str | None = None) -> bool:
+    def ensure_permissions_config(
+        self,
+        crawl_permissions: str | None = None,
+        *,
+        crawl_permissions_version: int | None = None,
+        creating: bool | None = None,
+    ) -> bool:
         config = dict(self.config or {})
         permission = str(config.get("PERMISSIONS") or "").strip().lower()
         from archivebox.core.permissions import PERMISSIONS_PUBLIC, PERMISSIONS_VALUES, normalize_permissions
 
-        if permission not in PERMISSIONS_VALUES:
-            if self.crawl_id and not crawl_permissions:
-                crawl_permissions = Crawl.objects.filter(pk=self.crawl_id).values_list("permissions", flat=True).first()
-            config["PERMISSIONS"] = normalize_permissions(
-                crawl_permissions,
-                default=PERMISSIONS_PUBLIC,
+        creating = self._state.adding if creating is None else creating
+
+        if creating and self.crawl_id and (crawl_permissions is None or crawl_permissions_version is None):
+            crawl_row = (
+                Crawl.objects.filter(pk=self.crawl_id)
+                .values_list(
+                    "permissions",
+                    "permissions_version",
+                )
+                .first()
             )
+            if crawl_row is not None:
+                crawl_permissions = crawl_row[0] if crawl_permissions is None else crawl_permissions
+                crawl_permissions_version = crawl_row[1] if crawl_permissions_version is None else crawl_permissions_version
+
+        inherited_permissions = normalize_permissions(crawl_permissions, default=PERMISSIONS_PUBLIC)
+        inherited_version = int(crawl_permissions_version or 1)
+
+        if permission not in PERMISSIONS_VALUES:
+            # Inherit the crawl's *current* intent and version, so a snapshot
+            # born mid-publication is already converged and is never rewritten
+            # (or rolled back) by the running job.
+            config["PERMISSIONS"] = inherited_permissions
             self.config = config
+            if creating:
+                self.permissions_version = inherited_version
+                self.permissions_override = False
             return True
         elif config.get("PERMISSIONS") != permission:
             config["PERMISSIONS"] = permission
             self.config = config
-            return True
-        return False
+
+        if creating:
+            # A value matching the crawl intent is still inheritance; only a
+            # divergent explicit value (imports, API metadata) is an override.
+            if permission == inherited_permissions:
+                self.permissions_version = inherited_version
+                self.permissions_override = False
+            else:
+                self.permissions_override = True
+        return config is not self.config
 
     def validate_url_for_archiving(self, *, config: Mapping[str, Any] | Any | None = None) -> None:
         try:
@@ -1019,7 +1079,16 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
         update_fields = kwargs.get("update_fields")
         validate_url_field = self._state.adding or update_fields is None or "url" in update_fields
         if self.ensure_permissions_config() and update_fields is not None:
-            kwargs["update_fields"] = tuple(dict.fromkeys([*update_fields, "config"]))
+            kwargs["update_fields"] = tuple(
+                dict.fromkeys(
+                    [
+                        *update_fields,
+                        "config",
+                        "permissions_version",
+                        "permissions_override",
+                    ]
+                )
+            )
 
         if validate_url_field:
             self.validate_url_for_archiving()
@@ -3100,6 +3169,9 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
             "depth": self.depth,
             "status": self.status,
             "fs_version": self.fs_version,
+            "permissions": self.permissions,
+            "permissions_version": self.permissions_version,
+            "permissions_override": self.permissions_override,
             "archive_size": archive_size,
             "output_size": archive_size,
         }
@@ -3685,6 +3757,9 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
             "depth": self.depth,
             "status": self.status,
             "fs_version": self.fs_version,
+            "permissions": self.permissions,
+            "permissions_version": self.permissions_version,
+            "permissions_override": self.permissions_override,
             # Computed properties
             "domain": self.domain,
             "scheme": self.scheme,
@@ -4034,6 +4109,90 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
     @staticmethod
     def _ts_to_date_str(dt: datetime | None) -> str | None:
         return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None
+
+
+class PermissionPublish(ModelWithUUID):
+    """One durable visibility publication for a Crawl or a single Snapshot.
+
+    The intent (target permissions + monotonic version) is committed to the
+    parent/row first so gating surfaces converge immediately. Child Snapshot
+    rows and static JSON/HTML metadata are then converged in resumable batches
+    keyed by ``cursor``; a killed orchestrator process leaves the publication
+    PENDING/RUNNING and recovery resumes it instead of leaving the collection
+    with permanently mixed permissions.
+    """
+
+    objects = PagedQuerySet.as_manager()
+
+    class ScopeChoices(models.TextChoices):
+        CRAWL = "crawl", "Crawl"
+        SNAPSHOT = "snapshot", "Snapshot"
+
+    class StatusChoices(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RUNNING = "running", "Running"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+        SUPERSEDED = "superseded", "Superseded"
+
+    class PhaseChoices(models.TextChoices):
+        # Tightening: child rows first (fail closed at the intent anyway),
+        # then static metadata. Relaxation: static metadata first, rows open
+        # per child only after its files are rewritten.
+        ROWS = "rows", "Rows"
+        STATIC = "static", "Static"
+        COMPLETED = "completed", "Completed"
+
+    scope_type = models.CharField(max_length=16, choices=ScopeChoices.choices, db_index=True)
+    crawl = models.ForeignKey(
+        Crawl,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="permission_publish_set",
+    )
+    snapshot = models.ForeignKey(
+        "Snapshot",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="permission_publish_set",
+    )
+    old_permissions = models.CharField(max_length=16)
+    new_permissions = models.CharField(max_length=16)
+    version = models.PositiveIntegerField(db_index=True)
+    status = models.CharField(max_length=16, choices=StatusChoices.choices, default=StatusChoices.PENDING, db_index=True)
+    phase = models.CharField(max_length=16, choices=PhaseChoices.choices, default=PhaseChoices.ROWS)
+    # Last Snapshot fully converged (both row and static metadata). Batches
+    # resume strictly after this id, so the resume position is explicit.
+    cursor = models.CharField(max_length=64, null=True, blank=True)
+    snapshot_count = models.PositiveIntegerField(default=0)
+    processed_count = models.PositiveIntegerField(default=0)
+    last_error = models.TextField(blank=True, null=False, default="")
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    crawl_id: uuid.UUID | None
+
+    class Meta(ModelWithUUID.Meta):
+        app_label = "core"
+        verbose_name = "Permission Publication"
+        verbose_name_plural = "Permission Publications"
+        indexes = [
+            models.Index(fields=["status", "scope_type", "created_at"], name="perm_publish_status_idx"),
+            models.Index(fields=["crawl", "version"], name="perm_publish_crawl_ver_idx"),
+            models.Index(fields=["snapshot", "version"], name="perm_publish_snap_ver_idx"),
+        ]
+
+    def __str__(self) -> str:
+        target = self.crawl_id if self.scope_type == self.ScopeChoices.CRAWL else self.snapshot_id
+        return f"[{self.id}] {self.scope_type} {target} {self.old_permissions}->{self.new_permissions}@v{self.version} {self.status}"
+
+    @property
+    def tightens(self) -> bool:
+        from archivebox.core.permissions import PERMISSIONS_RANK
+
+        return PERMISSIONS_RANK[self.new_permissions] > PERMISSIONS_RANK[self.old_permissions]
 
 
 class ArchiveResult(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithNotes):

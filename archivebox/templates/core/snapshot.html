@@ -5,6 +5,8 @@
     <head>
         <title>{{title}}</title>
         <meta charset="utf-8" name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="archivebox:permissions" content="{{ snapshot_permissions }}">
+        <meta name="archivebox:permissions-version" content="{{ snapshot.permissions_version }}">
         <style>
             /* Keep this inline, don't move to external css file because this template is used to generate static exports that need to be usable as-is without an accompanying staticfiles dir */
             * { box-sizing: border-box; }
