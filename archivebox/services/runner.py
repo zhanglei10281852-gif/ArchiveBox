@@ -1812,6 +1812,13 @@ def _run_due_snapshot_locked(
                 return run_snapshot_maintenance(str(snapshot.id))
         return parent_reconciled
 
+    # A URL filter generation newer than this Snapshot's acceptance must win
+    # before any hook runs: rejected rows move to the durable deleting queue,
+    # relaxed rules let the row keep running under the current generation.
+    filter_reconciled = snapshot.reconcile_url_filter_generation(lock_seconds=lock_seconds)
+    if filter_reconciled is not None:
+        return filter_reconciled
+
     if snapshot.is_paused:
         # Paused work never executes out of band. ArchiveResult rows are
         # historical projections and are not rewritten as scheduler state.

@@ -141,6 +141,16 @@ def _save_archiveresult_event_to_db(
     if snapshot is None:
         return
 
+    # A late hook result for a Snapshot a newer filter rule rejected must not
+    # leave any visible output: no ArchiveResult row, no title/size update, no
+    # discovery projection. The deleting queue removes the files the hook
+    # already wrote and cancels the still-running writer.
+    if snapshot.status == Snapshot.DELETING_STATE:
+        return
+    if not snapshot.accepted_under_current_url_filters():
+        snapshot.request_filter_deletion()
+        return
+
     if event.status == "cancelled":
         # Cancellation supplies no new capture outcome. Preserve the existing
         # result and files; the hook's next execution overwrites its own row
@@ -251,6 +261,12 @@ def mark_archiveresult_started(event: ProcessStartedEvent, *, snapshot_id: str, 
         raise ValueError("ProcessStartedEvent.start_ts is required")
     snapshot = Snapshot.objects.filter(id=snapshot_id).first()
     if snapshot is None:
+        return
+    # Do not register a hook that starts after its Snapshot was converged to
+    # deletion by a newer filter rule; the durable queue owns cancellation.
+    if snapshot.status == Snapshot.DELETING_STATE or not snapshot.accepted_under_current_url_filters():
+        if snapshot.status != Snapshot.DELETING_STATE:
+            snapshot.request_filter_deletion()
         return
     result, _created = ArchiveResult.get_or_create_by_hook(
         snapshot,

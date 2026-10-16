@@ -20,6 +20,14 @@ def project_discovered_snapshots(snapshot_id: str) -> list:
     snapshot = Snapshot.objects.select_related("crawl", "crawl__created_by", "crawl__persona").filter(id=snapshot_id).first()
     if snapshot is None:
         return []
+    # Late parser output from an old page must not re-queue URLs a newer
+    # filter generation rejects. A row already converging to deletion is not
+    # projected from at all, so its discoveries cannot resurrect it.
+    if snapshot.status == Snapshot.DELETING_STATE:
+        return []
+    if not snapshot.accepted_under_current_url_filters():
+        snapshot.request_filter_deletion()
+        return []
     crawl = snapshot.crawl
     if crawl.status not in crawl.RUNNABLE_STATES or crawl.is_paused or snapshot.depth >= crawl.max_depth:
         return []
@@ -54,6 +62,16 @@ def finalize_completed_snapshot(
 
     snapshot = Snapshot.objects.select_related("crawl", "crawl__created_by").filter(id=snapshot_id).first()
     if snapshot is None:
+        return
+
+    # The submit boundary re-checks the rule generation that was current when
+    # the attempt started. A Snapshot converged to deletion by a newer rule
+    # takes no seal, no index, and no late ArchiveResult-visible output; the
+    # durable deleting queue already owns its processes and files.
+    if snapshot.status == Snapshot.DELETING_STATE:
+        return
+    if not snapshot.accepted_under_current_url_filters():
+        snapshot.request_filter_deletion()
         return
 
     # urls.jsonl is durable hook output. Project it while the Snapshot/Crawl are
@@ -152,6 +170,14 @@ class SnapshotService(BaseService):
 
         if snapshot is not None:
             if snapshot.is_paused:
+                return
+            if snapshot.status == Snapshot.DELETING_STATE:
+                return
+            if not await sync_to_async(snapshot.accepted_under_current_url_filters, thread_sensitive=True)():
+                # Crawl-isolation admission reaches Snapshot work through this
+                # event. A rule that changed after load_run_state() selected
+                # this row converges it here instead of owning the attempt.
+                await sync_to_async(snapshot.request_filter_deletion, thread_sensitive=True)()
                 return
             was_sealed = snapshot.status == Snapshot.StatusChoices.SEALED
             if snapshot.status == Snapshot.StatusChoices.QUEUED:

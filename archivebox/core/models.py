@@ -507,6 +507,10 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
         default=ModelWithQueue.StatusChoices.QUEUED,
     )
     config = models.JSONField(default=dict, null=False, blank=False, editable=True)
+    # Crawl.url_filter_version this Snapshot's URL passed when it was accepted.
+    # When the crawl's current generation is newer, the runner re-checks the
+    # URL against the current filters before claiming or submitting work.
+    url_filter_version = models.PositiveBigIntegerField(default=0, null=False, blank=False)
     permissions = models.GeneratedField(
         expression=Coalesce(KT("config__PERMISSIONS"), Value("private"), output_field=models.CharField(max_length=16)),
         output_field=models.CharField(max_length=16, null=False),
@@ -710,9 +714,15 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
         plugin_names = sorted({name.strip() for name in plugins if name.strip()})
         if not plugin_names:
             return False
+        # A row queued for deletion never returns to scheduling. Late Redo /
+        # plugin requests must not resurrect a Snapshot under cleanup.
+        if type(self).objects.filter(pk=self.pk).values_list("status", flat=True).first() == self.DELETING_STATE:
+            return False
         retry_at = when or timezone.now()
         for _attempt in range(8):
             current = type(self).objects.select_related("crawl").get(pk=self.pk)
+            if current.status == self.DELETING_STATE:
+                return False
             pending_plugins = {str(name).strip() for name in (current.config or {}).get("RETRY_PLUGINS", []) if str(name).strip()}
             config = {**(current.config or {}), "RETRY_PLUGINS": sorted(pending_plugins | set(plugin_names))}
             status = current.status if current.status == self.StatusChoices.SEALED else self.StatusChoices.QUEUED
@@ -795,6 +805,80 @@ class Snapshot(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelW
             return True
 
         return None
+
+    def request_filter_deletion(self) -> bool:
+        """Idempotently move this Snapshot into the durable deleting queue.
+
+        Filter-driven convergence shares the ordinary deletion queue: the
+        runner cancels live hook processes, removes archive output, and only
+        then hard-deletes the row. File/process failures stay retryable as
+        "deleting", including across service restarts.
+        """
+        updated = type(self).objects.filter(pk=self.pk).exclude(status=self.DELETING_STATE).request_delete()
+        if updated:
+            self.status = self.DELETING_STATE
+            self.retry_at = RETRY_AT_MAX
+        return bool(updated)
+
+    def accepted_under_current_url_filters(self) -> bool:
+        """Whether current Crawl filters still accept this open Snapshot.
+
+        A matching generation means the rule has not changed since this
+        Snapshot passed it. A newer generation forces a fresh URL evaluation:
+        passing adopts the current generation (relaxing a rule keeps existing
+        work but never restores already-cleaned rows), failing means the new
+        rule rejects this Snapshot. Rows already sealed or deleting are not
+        re-evaluated here.
+        """
+        if self.status in (self.StatusChoices.SEALED, self.DELETING_STATE):
+            return self.status == self.StatusChoices.SEALED
+        crawl = Crawl.objects.filter(pk=self.crawl_id).only("id", "config", "url_filter_version").first()
+        if crawl is None:
+            return False
+        current_version = int(crawl.url_filter_version or 0)
+        if int(self.url_filter_version or 0) >= current_version:
+            return True
+        if crawl.url_passes_filters(self.url, snapshot=self, use_effective_config=True):
+            updated = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .exclude(url_filter_version__gte=current_version)
+                .update(url_filter_version=current_version, modified_at=timezone.now())
+            )
+            if updated:
+                self.url_filter_version = current_version
+            return True
+        return False
+
+    def reconcile_url_filter_generation(self, *, lock_seconds: int = 60) -> bool | None:
+        """Runner claim gate for URL filter generations.
+
+        Converges an open Snapshot that a newer rule rejects before any hook
+        runs. Returns None when work may proceed, True when the runner should
+        skip this turn (converged here, or the lease was released), and False
+        when the claim could not be acquired so another owner can try.
+        """
+        if self.status in (self.StatusChoices.SEALED, self.DELETING_STATE):
+            return None
+        if self.accepted_under_current_url_filters():
+            return None
+        if not self.claim_processing_lock(lock_seconds=lock_seconds):
+            return False
+        self.refresh_from_db()
+        if self.status in (self.StatusChoices.SEALED, self.DELETING_STATE):
+            return True
+        if self.accepted_under_current_url_filters():
+            # Rule was relaxed between selection and claim. Release the lease
+            # for a normal sweep instead of running under this claim.
+            owned_retry_at = self.retry_at
+            self.safe_update(
+                {"retry_at": timezone.now()},
+                refresh=False,
+                extra_filter={"retry_at": owned_retry_at},
+            )
+            return True
+        self.request_filter_deletion()
+        return True
 
     def finalize_completed_upload_results(self) -> int:
         now = timezone.now()

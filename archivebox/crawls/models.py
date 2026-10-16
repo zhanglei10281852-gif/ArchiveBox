@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from django.db import IntegrityError, models, transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.db.models.fields.json import KT
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
@@ -154,6 +154,11 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
 
     urls = models.TextField(blank=False, null=False, help_text="Newline-separated list of URLs to crawl")
     config = models.JSONField(default=dict, null=True, blank=True)
+    # Bumped by one CAS update every time the normalized URL_ALLOWLIST /
+    # URL_DENYLIST in config actually changes. Snapshots stamp the generation
+    # they were accepted at, so the runner can tell stale filter decisions
+    # from current ones with one durable, comparable integer.
+    url_filter_version = models.PositiveBigIntegerField(default=0, null=False, blank=False)
     permissions = models.GeneratedField(
         expression=KT("config__PERMISSIONS"),
         output_field=models.CharField(max_length=16, null=True),
@@ -579,6 +584,13 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
                 self.config = config
         return dict(self.config or {})
 
+    def current_url_filter_version(self) -> int:
+        """Durable URL filter generation, refreshing a possibly stale instance."""
+        if self.pk:
+            version = type(self).objects.filter(pk=self.pk).values_list("url_filter_version", flat=True).first()
+            self.url_filter_version = int(version or 0)
+        return int(self.url_filter_version or 0)
+
     def get_url_allowlist(self, *, use_effective_config: bool = False, snapshot=None) -> list[str]:
         if use_effective_config:
             config = self.get_current_config(refresh=True)
@@ -629,38 +641,159 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
 
         self.config = config
 
+    @classmethod
+    def _empty_filter_change_result(cls) -> dict[str, int | str | bool]:
+        return {
+            "changed": False,
+            "removed_urls": 0,
+            "accepted_snapshots": 0,
+            "cancelled_snapshots": 0,
+            "stopped_snapshots": 0,
+            "pending_delete_snapshots": 0,
+            "deleted_snapshots": 0,
+        }
+
+    def normalized_url_filters(self) -> tuple[list[str], list[str]]:
+        """Current durable allow/deny patterns, normalized, from the DB row."""
+        config = self.get_current_config(refresh=bool(self.pk))
+        return (
+            self.split_filter_patterns(config.get("URL_ALLOWLIST", "")),
+            self.split_filter_patterns(config.get("URL_DENYLIST", "")),
+        )
+
+    def apply_url_filter_change(self, allowlist, denylist, *, max_attempts: int = 5) -> dict[str, int | str | bool]:
+        """Persist one effective URL_ALLOWLIST/URL_DENYLIST edit and reconcile work.
+
+        Every admin entry point (the Crawl form and "exclude this domain") goes
+        through this method. The normalized pattern lists are compared against
+        the durable row: an actual difference bumps ``url_filter_version`` with
+        a compare-and-swap UPDATE, and afterwards every still-open Snapshot the
+        new rules reject converges through the durable deleting queue instead
+        of being hard-deleted in the request. Rules that merely relax never
+        restore rows that were already cleaned.
+        """
+        allow_patterns = self.split_filter_patterns(allowlist)
+        deny_patterns = self.split_filter_patterns(denylist)
+
+        changed = False
+        for _attempt in range(max_attempts):
+            if self.pk:
+                current = type(self).objects.filter(pk=self.pk).values("config", "url_filter_version").first()
+                if current is None:
+                    raise type(self).DoesNotExist(f"{type(self).__name__} matching query does not exist.")
+                current_config = dict(current["config"] or {})
+                current_version = int(current["url_filter_version"] or 0)
+            else:
+                current_config = dict(self.config or {})
+                current_version = int(self.url_filter_version or 0)
+
+            current_allow = self.split_filter_patterns(current_config.get("URL_ALLOWLIST", ""))
+            current_deny = self.split_filter_patterns(current_config.get("URL_DENYLIST", ""))
+
+            next_config = dict(current_config)
+            if allow_patterns:
+                next_config["URL_ALLOWLIST"] = "\n".join(allow_patterns)
+            else:
+                next_config.pop("URL_ALLOWLIST", None)
+            if deny_patterns:
+                next_config["URL_DENYLIST"] = "\n".join(deny_patterns)
+            else:
+                next_config.pop("URL_DENYLIST", None)
+
+            if current_allow == allow_patterns and current_deny == deny_patterns:
+                # No effective change. Keep the instance aligned with the row.
+                self.config = current_config
+                self.url_filter_version = current_version
+                break
+
+            if not self.pk:
+                self.config = next_config
+                self.url_filter_version = current_version
+                changed = True
+                break
+
+            updated = (
+                type(self)
+                .objects.filter(pk=self.pk, url_filter_version=current_version)
+                .update(
+                    config=next_config,
+                    url_filter_version=F("url_filter_version") + 1,
+                    modified_at=timezone.now(),
+                )
+            )
+            if updated == 1:
+                self.config = next_config
+                self.url_filter_version = current_version + 1
+                changed = True
+                break
+            # A concurrent filter edit won the generation. Re-read and compare.
+        else:
+            raise RuntimeError(f"Crawl {self.pk} URL filters changed repeatedly while applying edit")
+
+        if not self.pk:
+            return {**self._empty_filter_change_result(), "changed": changed}
+
+        result = self.apply_crawl_config_filters()
+        return {**result, "changed": changed}
+
     def apply_crawl_config_filters(self) -> dict[str, int]:
+        """Reconcile Crawl.urls and open Snapshots with the filters stored now.
+
+        Runs after every effective filter edit (and is idempotent on repeat).
+        Rejected queued/paused Snapshots stop scheduling immediately; rejected
+        started Snapshots converge through the same durable deleting queue the
+        runner uses for ordinary deletes, which cancels their hook processes
+        and removes their output. Sealed Snapshots are history and stay.
+        """
         from archivebox.core.models import Snapshot
 
+        result = {
+            "removed_urls": 0,
+            "accepted_snapshots": 0,
+            "cancelled_snapshots": 0,
+            "stopped_snapshots": 0,
+            "pending_delete_snapshots": 0,
+            "deleted_snapshots": 0,
+        }
+        if not self.pk:
+            return result
+
+        # The durable row is the authority: the caller may hold a stale config.
+        self.refresh_from_db(fields=["config", "url_filter_version"])
         removed_urls = self.prune_urls(
             lambda url: not self.url_passes_filters(url, use_effective_config=False),
         )
+        result["removed_urls"] = len(removed_urls)
 
-        filtered_snapshots = [
-            snapshot
-            for snapshot in self.snapshot_set.filter(
+        open_snapshots = list(
+            self.snapshot_set.filter(
                 status__in=[
                     Snapshot.StatusChoices.QUEUED,
                     Snapshot.StatusChoices.STARTED,
                     Snapshot.StatusChoices.PAUSED,
                 ],
-            ).only("pk", "url", "status")
-            if not self.url_passes_filters(snapshot.url, snapshot=snapshot, use_effective_config=False)
-        ]
+            ).only("pk", "url", "status", "config")
+        )
+        rejected_ids: list[uuid.UUID] = []
+        for snapshot in open_snapshots:
+            if self.url_passes_filters(snapshot.url, snapshot=snapshot, use_effective_config=False):
+                result["accepted_snapshots"] += 1
+                continue
+            rejected_ids.append(snapshot.pk)
+            if snapshot.status == Snapshot.StatusChoices.STARTED:
+                result["cancelled_snapshots"] += 1
+            else:
+                result["stopped_snapshots"] += 1
 
-        deleted_snapshots = 0
-        if filtered_snapshots:
-            started_snapshots = [snapshot for snapshot in filtered_snapshots if snapshot.status == Snapshot.StatusChoices.STARTED]
-            for snapshot in started_snapshots:
-                snapshot.cancel_running_hooks()
+        if rejected_ids:
+            # One tight scheduler UPDATE moves every rejected row into the
+            # durable deleting queue. The runner kills live writers and removes
+            # files; failures stay retryable as "deleting", including restarts.
+            Snapshot.objects.filter(pk__in=rejected_ids).request_delete()
 
-            filtered_snapshot_ids = [snapshot.pk for snapshot in filtered_snapshots]
-            deleted_snapshots, _ = self.snapshot_set.filter(pk__in=filtered_snapshot_ids).delete()
-
-        return {
-            "removed_urls": len(removed_urls),
-            "deleted_snapshots": deleted_snapshots,
-        }
+        result["deleted_snapshots"] = len(rejected_ids)
+        result["pending_delete_snapshots"] = self.snapshot_set.filter(status=Snapshot.DELETING_STATE).count()
+        return result
 
     def _iter_url_lines(self) -> Iterator[tuple[str, str]]:
         # Lazy: callers such as output_dir only need the first URL, and
@@ -752,27 +885,20 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             return {
                 "domain": "",
                 "created": False,
-                "removed_urls": 0,
-                "deleted_snapshots": 0,
+                **self._empty_filter_change_result(),
             }
 
-        domains = self.get_url_denylist(use_effective_config=False)
-        created = normalized_domain not in domains
-        if created:
-            domains.append(normalized_domain)
-            self.set_url_filters(
-                self.get_url_allowlist(use_effective_config=False),
-                domains,
-            )
-            self.save(update_fields=["config", "modified_at"])
-
-        filter_result = self.apply_crawl_config_filters()
+        # Read the durable rule through the same normalization the change flow
+        # uses; a stale caller instance must not clobber a concurrent edit.
+        allowlist, denylist = self.normalized_url_filters()
+        created = normalized_domain not in denylist
+        next_denylist = [*denylist, normalized_domain] if created else denylist
+        filter_result = self.apply_url_filter_change(allowlist, next_denylist)
 
         return {
             "domain": normalized_domain,
             "created": created,
-            "removed_urls": filter_result["removed_urls"],
-            "deleted_snapshots": filter_result["deleted_snapshots"],
+            **filter_result,
         }
 
     def resolve_persona(self):
@@ -902,7 +1028,12 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             url = validate_url(url)
         except ValueError:
             return False
-        if not self.url_passes_filters(url):
+        # Re-read the durable rule and its generation before appending. A
+        # caller may hold a Crawl instance that predates an admin filter edit,
+        # and a denylist added while the crawl runs must reject late enqueues.
+        if self.pk:
+            self.refresh_from_db(fields=["config", "url_filter_version"])
+        if not self.url_passes_filters(url, use_effective_config=False):
             return False
 
         depth = entry.get("depth", 1)
@@ -947,10 +1078,16 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
         tags_by_name: dict[str, Tag] = {}
         server_config = get_config()
 
+        current_filter_version = self.current_url_filter_version()
+
         for line in self.urls.splitlines():
             if not line.strip():
                 continue
             config = self.get_current_config(refresh=True)
+            # Re-read the generation alongside the rule on every line so a
+            # filter edit landing mid-creation cannot be bypassed by a loop
+            # that accepted earlier URLs under the old rule.
+            current_filter_version = self.current_url_filter_version()
             only_new_urls = bool(self._config_value(config, "ONLY_NEW", True))
 
             # Parse JSONL or plain URL
@@ -1000,6 +1137,9 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
                 "timestamp": timestamp or str(timezone.now().timestamp()),
                 "status": Snapshot.INITIAL_STATE,
                 "retry_at": timezone.now(),
+                # Acceptance is stamped with the rule generation it passed, so
+                # a later filter edit can re-check exactly these rows.
+                "url_filter_version": current_filter_version,
                 # Note: created_by removed in 0.9.0 - Snapshot inherits from Crawl
             }
             try:
@@ -1018,7 +1158,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
                             "crawl": self,
                         }.items():
                             setattr(snapshot, field, value)
-                        snapshot.save(update_fields=["depth", "title", "timestamp", "status", "retry_at", "url", "crawl", "modified_at"])
+                        snapshot.save(update_fields=["depth", "title", "timestamp", "status", "retry_at", "url_filter_version", "url", "crawl", "modified_at"])
                     else:
                         snapshot = Snapshot(id=snapshot_id, url=url, crawl=self, **defaults)
                         snapshot.save()
@@ -1098,6 +1238,10 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             return []
 
         config = self.get_current_config(refresh=True)
+        # Stamp every newly discovered child with the rule generation it was
+        # filtered under; late parser output from an old page passes the same
+        # current rule before this point or never reaches the queue.
+        current_filter_version = self.current_url_filter_version()
         server_config = get_config()
         if parent_snapshot is not None and parent_snapshot.config:
             config.update(parent_snapshot.config)
@@ -1144,6 +1288,10 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
             if iri_to_uri(snapshot.url) in url_for_uri
         }
         for url, snapshot in existing_in_crawl.items():
+            # Late discovery records belong to a row the new filters already
+            # routed to deletion: they must not enrich or bring it back.
+            if snapshot.status == Snapshot.DELETING_STATE:
+                continue
             record = deduped_records[url]
             update_fields = []
             title = Snapshot._normalize_title_candidate(str(record.get("title") or "").strip()[:512], snapshot_url=url)
@@ -1202,6 +1350,7 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
                     depth=depth,
                     status=Snapshot.StatusChoices.QUEUED,
                     retry_at=now,
+                    url_filter_version=current_filter_version,
                     bookmarked_at=bookmarked_at,
                     created_at=now,
                 ),

@@ -4,6 +4,7 @@ import re
 
 import pytest
 from django.urls import reverse
+from django.utils import timezone
 
 from archivebox.core.models import Snapshot
 from archivebox.crawls.admin import CrawlAdminForm
@@ -426,6 +427,7 @@ def test_crawl_admin_exclude_domain_action_prunes_urls_and_pending_snapshots(cli
     preserved_file = preserved_snapshot.output_dir / "captured.txt"
     preserved_file.parent.mkdir(parents=True, exist_ok=True)
     preserved_file.write_text("preserved capture")
+    assert crawl.url_filter_version == 0
 
     client.force_login(admin_user)
     response = client.post(
@@ -437,15 +439,43 @@ def test_crawl_admin_exclude_domain_action_prunes_urls_and_pending_snapshots(cli
     payload = response.json()
     assert payload["ok"] is True
     assert payload["domain"] == "cdn.example.com"
+    assert payload["created"] is True
+    assert payload["changed"] is True
+    # The response reports what actually happened: one queued match was stopped
+    # and is the one row now pending cleanup; no running capture was cancelled.
+    assert payload["removed_urls"] == 2
+    assert payload["cancelled_snapshots"] == 0
+    assert payload["stopped_snapshots"] == 1
+    assert payload["pending_delete_snapshots"] == 1
+    assert payload["deleted_snapshots"] == 1
 
     crawl.refresh_from_db()
+    assert crawl.url_filter_version == 1
     assert "cdn.example.com" in crawl.get_url_denylist(use_effective_config=False)
     assert "https://cdn.example.com/asset.js" not in crawl.urls
     assert "https://cdn.example.com/second.js" not in crawl.urls
     assert "https://example.com/root" in crawl.urls
-    assert not Snapshot.objects.filter(pk=queued_snapshot.pk).exists()
+
+    # Rejected pending work stops scheduling immediately but converges through
+    # the durable deleting queue; the HTTP request never removed files itself.
+    queued_snapshot.refresh_from_db()
+    assert queued_snapshot.status == Snapshot.DELETING_STATE
+    assert removed_dir.exists()
     assert Snapshot.objects.filter(pk=preserved_snapshot.pk).exists()
+    assert preserved_file.read_text() == "preserved capture"
+
+    due_snapshots = Snapshot.objects.filter(
+        crawl__status__in=Crawl.RUNNABLE_STATES,
+        status__in=Snapshot.RUNNABLE_STATES,
+        retry_at__lte=timezone.now(),
+    )
+    assert list(due_snapshots) == []
+
+    # The runner's persistent queue finishes the cancellation, including files.
+    Snapshot.delete_requested()
+    assert not Snapshot.objects.filter(pk=queued_snapshot.pk).exists()
     assert not removed_dir.exists()
+    assert Snapshot.objects.filter(pk=preserved_snapshot.pk).exists()
     assert preserved_file.read_text() == "preserved capture"
 
 

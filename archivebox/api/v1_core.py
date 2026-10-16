@@ -536,6 +536,10 @@ def create_archiveresult(
 ):
     """Create or update an ArchiveResult with one or more output files."""
     snapshot = _get_snapshot_by_ref(snapshot_id)
+    if snapshot.status == Snapshot.DELETING_STATE:
+        # Late uploads must not recreate output for a Snapshot a newer filter
+        # rule (or an ordinary delete) is already cleaning up.
+        raise HttpError(409, "Snapshot is queued for deletion")
     plugin_name = _normalize_uploaded_archiveresult_plugin(plugin)
     normalized_status = ArchiveResult.normalize_status(status)
     parsed_output_json = _parse_archiveresult_output_json(output_json)
@@ -600,6 +604,8 @@ def patch_archiveresult(
 ):
     """Append or replace files on an existing ArchiveResult."""
     result = ArchiveResult.objects.select_related("snapshot__crawl__created_by").get(_uuid_ref_query("id", archiveresult_id))
+    if result.snapshot.status == Snapshot.DELETING_STATE:
+        raise HttpError(409, "Snapshot is queued for deletion")
     uploaded_output_files = _write_archiveresult_files(
         request,
         result.snapshot,
@@ -1033,6 +1039,10 @@ def create_snapshot(request: HttpRequest, data: SnapshotCreateSchema):
 def patch_snapshot(request: HttpRequest, snapshot_id: str, data: SnapshotUpdateSchema):
     """Update a snapshot (e.g., set status=sealed to cancel queued work)."""
     snapshot = _get_snapshot_by_ref(snapshot_id)
+    if snapshot.status == Snapshot.DELETING_STATE:
+        # Deletion is a one-way queue: a late status/action PATCH must not pull
+        # the row back into scheduling while cleanup is pending or retrying.
+        raise HttpError(409, "Snapshot is queued for deletion")
     crawl_id = str(snapshot.crawl_id)
 
     payload = data.dict(exclude_unset=True)

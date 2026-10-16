@@ -232,8 +232,8 @@ def render_snapshots_list(snapshots_qs, request=None, crawl=None, page_size=50, 
                 <button type="button"
                         class="crawl-snapshots-action"
                         data-post-url="{escape(exclude_url)}"
-                        data-confirm="Exclude this domain from the crawl? This removes matching queued URLs, deletes pending matching snapshots, and blocks future matches."
-                        title="Exclude this domain from this crawl. This removes matching URLs from the crawl queue, deletes pending matching snapshots, and blocks future matches."
+                        data-confirm="Exclude this domain from the crawl? This removes matching queued URLs, cancels running and stops pending matching snapshots via the cleanup queue, and blocks future matches."
+                        title="Exclude this domain from this crawl. This removes matching URLs from the crawl queue, cancels running and stops pending matching snapshots via the cleanup queue, and blocks future matches."
                         aria-label="Exclude domain from crawl"
                         style="border: 1px solid #ddd; background: #fff; color: #666; border-radius: 4px; width: 28px; height: 28px; cursor: pointer;">⊘</button>
             '''
@@ -607,12 +607,18 @@ class CrawlAdminForm(forms.ModelForm):
     def save(self, commit=True):
         instance = super().save(commit=False)
         instance.tags_str = self.cleaned_data.get("tags_editor", "")
-        if f"{self.add_prefix('url_filters')}_allowlist" in self.data or f"{self.add_prefix('url_filters')}_denylist" in self.data:
+        # The widget and the raw config JSON textarea are the only two places a
+        # filter edit can arrive. Resolve the desired normalized patterns plus
+        # the durable pre-edit ones, so every effective change goes through the
+        # same generation-bumping change flow as "exclude this domain".
+        widget_submitted = (
+            f"{self.add_prefix('url_filters')}_allowlist" in self.data
+            or f"{self.add_prefix('url_filters')}_denylist" in self.data
+        )
+        if widget_submitted:
             url_filters = self.cleaned_data.get("url_filters") or {}
-            instance.set_url_filters(
-                url_filters.get("allowlist", ""),
-                url_filters.get("denylist", ""),
-            )
+            desired_allowlist = self.instance.split_filter_patterns(url_filters.get("allowlist", ""))
+            desired_denylist = self.instance.split_filter_patterns(url_filters.get("denylist", ""))
             config = dict(instance.config or {})
             only_new = bool(url_filters.get("only_new"))
             inherited_only_new = self.inherited_only_new(instance)
@@ -621,10 +627,55 @@ class CrawlAdminForm(forms.ModelForm):
             else:
                 config.pop("ONLY_NEW", None)
             instance.config = config
+        else:
+            desired_allowlist = Crawl.split_filter_patterns((instance.config or {}).get("URL_ALLOWLIST", ""))
+            desired_denylist = Crawl.split_filter_patterns((instance.config or {}).get("URL_DENYLIST", ""))
+
+        if instance.pk:
+            old_config = Crawl.objects.filter(pk=instance.pk).values_list("config", flat=True).first() or {}
+            old_allowlist = Crawl.split_filter_patterns(old_config.get("URL_ALLOWLIST", ""))
+            old_denylist = Crawl.split_filter_patterns(old_config.get("URL_DENYLIST", ""))
+        else:
+            old_allowlist, old_denylist = desired_allowlist, desired_denylist
+        filters_changed = (old_allowlist, old_denylist) != (desired_allowlist, desired_denylist)
+
+        def stage_old_filters(target) -> None:
+            # Keep the previously effective rule in place during the ordinary
+            # row save so the rule never briefly becomes "allow all" between
+            # the two UPDATEs; the generation bump writes the new rule next.
+            config = dict(target.config or {})
+            if old_allowlist:
+                config["URL_ALLOWLIST"] = "\n".join(old_allowlist)
+            else:
+                config.pop("URL_ALLOWLIST", None)
+            if old_denylist:
+                config["URL_DENYLIST"] = "\n".join(old_denylist)
+            else:
+                config.pop("URL_DENYLIST", None)
+            target.config = config
+
+        # Set when an existing Crawl still needs the unified change flow after
+        # its normal row save. CrawlAdmin.save_model() owns running it; direct
+        # form.save(commit=True) callers run it below.
+        self.pending_filter_change: tuple[list[str], list[str]] | None = (
+            (desired_allowlist, desired_denylist) if instance.pk and filters_changed else None
+        )
+        self.filter_change_result = None
+
         if commit:
-            instance.save()
-            instance.apply_crawl_config_filters()
+            if instance.pk and filters_changed:
+                stage_old_filters(instance)
+                instance.save()
+                self.filter_change_result = instance.apply_url_filter_change(desired_allowlist, desired_denylist)
+            else:
+                if widget_submitted:
+                    instance.set_url_filters(desired_allowlist, desired_denylist)
+                instance.save()
             self._save_m2m()
+        elif instance.pk and filters_changed:
+            stage_old_filters(instance)
+        elif widget_submitted:
+            instance.set_url_filters(desired_allowlist, desired_denylist)
         return instance
 
 
@@ -851,6 +902,25 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
             ),
         ]
         return custom_urls + urls
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        pending_filter_change = getattr(form, "pending_filter_change", None)
+        if not change or not pending_filter_change:
+            return
+        allowlist, denylist = pending_filter_change
+        result = obj.apply_url_filter_change(allowlist, denylist)
+        form.filter_change_result = result
+        # Report what the rule change actually did, not what the form posted.
+        summary = (
+            f"{result['accepted_snapshots']} snapshot(s) still accepted, "
+            f"{result['cancelled_snapshots']} running cancelled, "
+            f"{result['stopped_snapshots']} queued/paused stopped, "
+            f"{result['pending_delete_snapshots']} pending cleanup, "
+            f"{result['removed_urls']} URL(s) pruned"
+        )
+        level = messages.WARNING if result["pending_delete_snapshots"] else messages.SUCCESS
+        messages.add_message(request, level, f"URL filters updated: {summary}.")
 
     def get_actions(self, request):
         actions = super().get_actions(request)
@@ -1156,10 +1226,20 @@ class CrawlAdmin(ConfigEditorMixin, BaseModelAdmin):
         crawl = get_object_or_404(Crawl, pk=object_id)
         snapshot = get_object_or_404(Snapshot, pk=snapshot_id, crawl=crawl)
 
-        if snapshot.status == Snapshot.StatusChoices.STARTED:
-            snapshot.cancel_running_hooks()
-
         removed_urls = crawl.prune_url(snapshot.url)
+        if snapshot.status == Snapshot.StatusChoices.STARTED:
+            # A live writer is never hard-deleted inside the HTTP request. The
+            # durable deleting queue cancels its hook processes and removes
+            # the output under the runner, retrying failures across restarts.
+            queued_count = Snapshot.objects.filter(pk=snapshot.pk).request_delete()
+            return JsonResponse(
+                {
+                    "ok": True,
+                    "snapshot_id": str(snapshot.id),
+                    "removed_urls": removed_urls,
+                    "queued_count": queued_count,
+                }
+            )
         snapshot.delete()
         return JsonResponse(
             {
