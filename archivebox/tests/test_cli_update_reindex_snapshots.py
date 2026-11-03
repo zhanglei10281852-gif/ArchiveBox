@@ -377,9 +377,22 @@ def test_update_schedule_backfills_missing_search_index_without_reopening_snapsh
     (snapshot.output_dir / "title").mkdir(parents=True, exist_ok=True)
     (snapshot.output_dir / "title" / "title.txt").write_text("Scheduled Search Index")
 
+    from archivebox.crawls.models import CrawlScheduleRun
+
     assert schedule.dispatch() is None
-    first_modified_at = schedule.modified_at
+    claimed_slot = schedule.current_slot()
+    succeeded_runs = CrawlScheduleRun.objects.filter(
+        schedule=schedule,
+        slot_at=claimed_slot,
+        status=CrawlScheduleRun.StatusChoices.SUCCEEDED,
+    )
+    assert succeeded_runs.count() == 1
+    # A slot already confirmed succeeded must not run maintenance a second
+    # time: the second force-dispatch skips the slot without new side effects.
+    stale_snapshot.refresh_from_db()
+    retry_at_after_first = stale_snapshot.retry_at
     assert schedule.dispatch() is None
+    assert CrawlScheduleRun.objects.filter(schedule=schedule).count() == 1
 
     snapshot.refresh_from_db()
     stale_snapshot.refresh_from_db()
@@ -395,8 +408,8 @@ def test_update_schedule_backfills_missing_search_index_without_reopening_snapsh
     assert not ArchiveResult.objects.filter(snapshot=snapshot, status=ArchiveResult.StatusChoices.QUEUED).exists()
     assert set(snapshot.archiveresult_set.values_list("plugin", flat=True)) == {"search_backend_sqlite"}
     assert stale_snapshot.retry_at is not None
+    assert stale_snapshot.retry_at == retry_at_after_first
     assert not ArchiveResult.objects.filter(snapshot=stale_snapshot, plugin="search_backend_sqlite").exists()
-    assert schedule.modified_at >= first_modified_at
 
 
 @pytest.mark.django_db

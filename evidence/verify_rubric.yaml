@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 两个 daemon 对同一到期 CrawlSchedule 并发轮询时，具体时间槽只有一个执行者取得派发权，并且只产生一个关联 Crawl 或一次维护执行。
+  - id: 2
+    type: f2p
+    text: schedule --run-all 与后台轮询交错时遵循同一领取和确认协议，不会绕过周期唯一性，也会返回与实际接受结果一致的计数。
+  - id: 3
+    type: f2p
+    text: 普通归档计划把派生 Crawl 持久关联到具体计划周期，进程在创建前后退出或数据库写入冲突时可接管且不会重复物化。
+  - id: 4
+    type: f2p
+    text: 计划型维护失败时不会把该周期误记为成功，后续 runner 可重试；已经成功确认的维护周期在重启后不会重复执行。
+  - id: 5
+    type: f2p
+    text: 领取期间禁用、删除或改期计划形成确定顺序，旧领取不能按新配置提交，下一合法时间由更新后的 schedule 计算。
+  - id: 6
+    type: p2p
+    text: 没有并发和失败的单实例 daemon 仍按原 cron 创建 Crawl 或运行维护，并继续处理派生 Crawl 的既有生命周期。
+  - id: 7
+    type: p2p
+    text: 计划创建、展示、清理和 next_run_at 等现有 CLI 与管理页行为保持，已有计划数据可兼容迁移。

@@ -41,3 +41,17 @@ def validate_schedule(schedule: str) -> str:
 def next_run_for_schedule(schedule: str, after: datetime) -> datetime:
     normalized = validate_schedule(schedule)
     return croniter(normalized, after).get_next(datetime)
+
+
+def current_slot_for_schedule(schedule: str, now: datetime) -> datetime:
+    """Return the concrete cron slot that is due at ``now``.
+
+    The slot is the most recent cron fire at or before ``now``. Computing it
+    from the first fire strictly after ``now`` makes the boundary exact: at a
+    fire instant the current slot is that very fire, not the previous one.
+    Callers own deciding whether that slot is actually due (e.g. it must be
+    newer than the schedule's last-confirmed anchor).
+    """
+    normalized = validate_schedule(schedule)
+    next_fire = croniter(normalized, now).get_next(datetime)
+    return croniter(normalized, next_fire).get_prev(datetime)

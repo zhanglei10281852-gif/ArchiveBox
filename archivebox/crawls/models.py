@@ -1,17 +1,21 @@
 __package__ = "archivebox.crawls"
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from collections.abc import Iterable, Iterator, Mapping
 import uuid
 import json
+import logging
+import os
 import re
+import socket
+import threading
 from datetime import timedelta
 from archivebox.uuid_compat import CompactUUIDField, compact_uuid, uuid7
 from pathlib import Path
 from urllib.parse import urlparse
 
-from django.db import IntegrityError, models, transaction
-from django.db.models import Q
+from django.db import IntegrityError, OperationalError, models, transaction
+from django.db.models import F, Q
 from django.db.models.fields.json import KT
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
@@ -32,11 +36,46 @@ from archivebox.base_models.models import (
     get_or_create_system_user_pk,
 )
 from archivebox.workers.models import ModelWithQueue
-from archivebox.crawls.schedule_util import next_run_for_schedule, validate_schedule
+from archivebox.crawls.schedule_util import current_slot_for_schedule, next_run_for_schedule, validate_schedule
 from archivebox.misc.util import equivalent_urls, iri_to_uri, parse_date, sanitize_html_text, validate_url
 
 if TYPE_CHECKING:
     from archivebox.core.models import Snapshot
+
+
+SCHEDULE_RUN_LEASE_SECONDS = 60
+SCHEDULE_RUN_HEARTBEAT_SECONDS = 15
+
+DISPATCH_DISPATCHED = "dispatched"
+DISPATCH_SKIPPED = "skipped"
+
+_UNSET = object()
+
+logger = logging.getLogger(__name__)
+
+
+class ScheduleDispatchResult(NamedTuple):
+    """Outcome of one shared schedule-slot dispatch attempt."""
+
+    state: str
+    run: "CrawlScheduleRun | None"
+    crawl: "Crawl | None"
+
+    @property
+    def dispatched(self) -> bool:
+        return self.state == DISPATCH_DISPATCHED
+
+
+class _SlotCommitGuardMiss(Exception):
+    """The schedule changed between slot claim and commit; roll the work back."""
+
+
+def _current_claim_owner() -> str:
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = "unknown-host"
+    return f"{host} pid={os.getpid()}"
 
 
 class CrawlSchedule(ModelWithUUID, ModelWithNotes):
@@ -89,7 +128,26 @@ class CrawlSchedule(ModelWithUUID, ModelWithNotes):
             self.template.schedule = self
 
     @property
-    def last_run_at(self):
+    def last_succeeded_slot_at(self):
+        """Latest slot confirmed succeeded; the anchor that survives restart.
+
+        Querysets built with ``with_run_state()`` annotate this to avoid a
+        per-schedule query on every daemon tick; otherwise it is read once.
+        """
+        cached = self.__dict__.get("last_success_slot_at", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        return (
+            self.runs.filter(status=CrawlScheduleRun.StatusChoices.SUCCEEDED)
+            .order_by("-slot_at")
+            .values_list("slot_at", flat=True)
+            .first()
+        )
+
+    def _legacy_last_run_at(self):
+        # Pre-claim display heuristic, kept verbatim for schedules that have
+        # no confirmed slot runs yet (also what makes freshly created plans
+        # wait for their first legal cron period).
         if self.kind == "update":
             return self.modified_at
         latest_crawl = self.crawl_set.order_by("-created_at").first()
@@ -100,30 +158,204 @@ class CrawlSchedule(ModelWithUUID, ModelWithNotes):
         return self.created_at
 
     @property
+    def last_run_at(self):
+        return self.last_succeeded_slot_at or self._legacy_last_run_at()
+
+    @property
     def next_run_at(self):
         return next_run_for_schedule(self.schedule, self.last_run_at)
 
+    def current_slot(self, now=None):
+        """The most recent cron fire at or before ``now`` for this schedule."""
+        now = now or timezone.now()
+        return current_slot_for_schedule(self.schedule, now)
+
+    def due_slot(self, now=None):
+        """Return the concrete slot currently due past the anchor, else None.
+
+        The anchor is the latest confirmed slot (survives restart) or the
+        legacy creation heuristic. A claimed/failed slot without success stays
+        due so an expired claim is safely taken over.
+        """
+        now = now or timezone.now()
+        slot = self.current_slot(now)
+        if slot <= self.last_run_at:
+            return None
+        return slot
+
     def is_due(self, now=None) -> bool:
         now = now or timezone.now()
-        return self.is_enabled and self.next_run_at <= now
+        return self.is_enabled and self.due_slot(now) is not None
 
     @property
     def kind(self) -> str:
         return str((self.config or {}).get("SCHEDULE_KIND") or "crawl")
 
-    def dispatch(self, queued_at=None) -> "Crawl | None":
-        """Run maintenance directly or enqueue one ordinary Crawl."""
-        queued_at = queued_at or timezone.now()
-        if self.kind == "update":
-            from archivebox.cli.archivebox_update import run_scheduled_maintenance
+    @classmethod
+    def with_run_state(cls, queryset=None):
+        """Annotate the latest succeeded slot for tick/display querysets."""
+        return (queryset or cls.objects).annotate(
+            last_success_slot_at=models.Max(
+                "runs__slot_at",
+                filter=Q(runs__status=CrawlScheduleRun.StatusChoices.SUCCEEDED),
+            ),
+        )
 
-            run_scheduled_maintenance()
-            type(self).objects.filter(pk=self.pk).update(modified_at=queued_at)
-            self.modified_at = queued_at
-            return None
-        return self.enqueue(queued_at=queued_at)
+    def dispatch_due(self, now=None, *, force: bool = False) -> ScheduleDispatchResult:
+        """Claim this schedule's current cron slot and execute it exactly once.
+
+        This is the single shared entry point for both ``schedule --run-all``
+        (force=True: run the current slot even before the first legal period)
+        and the background daemon poll (force=False: only due slots). Every
+        outcome is decided by the durable ``CrawlScheduleRun`` claim, so two
+        processes can never dispatch the same slot twice.
+        """
+        now = now or timezone.now()
+        if not self.is_enabled:
+            return ScheduleDispatchResult(DISPATCH_SKIPPED, None, None)
+        slot = self.current_slot(now) if force else self.due_slot(now)
+        if slot is None:
+            return ScheduleDispatchResult(DISPATCH_SKIPPED, None, None)
+        try:
+            claimed = CrawlScheduleRun.claim_slot(self, slot, now=now)
+        except (IntegrityError, OperationalError):
+            # Lost the unique race or hit a brief SQLite writer lock; the
+            # next scheduler pass re-evaluates the slot from durable state.
+            return ScheduleDispatchResult(DISPATCH_SKIPPED, None, None)
+        if claimed is None:
+            return ScheduleDispatchResult(DISPATCH_SKIPPED, None, None)
+        run, revision = claimed
+        if self.kind == "update":
+            return self._run_maintenance_slot(run, revision)
+        return self._materialize_crawl_slot(run, revision)
+
+    def dispatch(self, queued_at=None) -> "Crawl | None":
+        """Compatibility wrapper for a direct "run this schedule now" call.
+
+        Delegates to the shared slot claim (force) and returns the
+        materialized Crawl for crawl-kind schedules, None otherwise.
+        """
+        result = self.dispatch_due(queued_at, force=True)
+        return result.crawl
+
+    def _materialize_crawl_slot(self, run: "CrawlScheduleRun", revision) -> ScheduleDispatchResult:
+        # One short transaction couples the claim, the single materialized
+        # Crawl and the guarded success confirmation. No network/hook/filesystem
+        # work happens inside it; archiving runs later through the normal
+        # Crawl queue. A missed guard rolls the Crawl insert back, so a
+        # schedule disabled/deleted/rescheduled mid-claim yields nothing.
+        try:
+            with transaction.atomic():
+                crawl = Crawl.objects.filter(schedule_run=run).first()
+                if crawl is None:
+                    crawl = self._create_crawl_for_run(run)
+                now = timezone.now()
+                confirmed = CrawlScheduleRun.objects.filter(
+                    pk=run.pk,
+                    claim_token=run.claim_token,
+                    schedule__is_enabled=True,
+                    schedule__modified_at=revision,
+                ).update(
+                    status=CrawlScheduleRun.StatusChoices.SUCCEEDED,
+                    finished_at=now,
+                    claim_until=now,
+                    error="",
+                )
+                if confirmed != 1:
+                    raise _SlotCommitGuardMiss(str(run.pk))
+        except _SlotCommitGuardMiss:
+            # The claim committed before this short transaction, so mark the
+            # slot failed/expired in a separate autocommit write: it must be
+            # immediately identifiable as stale instead of sitting on a live
+            # lease while the schedule is disabled/deleted/rescheduled.
+            now = timezone.now()
+            CrawlScheduleRun.objects.filter(pk=run.pk, claim_token=run.claim_token).update(
+                status=CrawlScheduleRun.StatusChoices.FAILED,
+                claim_until=now,
+                finished_at=now,
+                error="schedule was disabled, deleted or rescheduled while crawl was materializing",
+            )
+            return ScheduleDispatchResult(DISPATCH_SKIPPED, None, None)
+        except IntegrityError:
+            # Defense in depth behind the OneToOne(schedule_run) constraint.
+            return ScheduleDispatchResult(DISPATCH_SKIPPED, None, None)
+        run.refresh_from_db()
+        return ScheduleDispatchResult(DISPATCH_DISPATCHED, run, crawl)
+
+    def _run_maintenance_slot(self, run: "CrawlScheduleRun", revision) -> ScheduleDispatchResult:
+        from archivebox.cli.archivebox_update import run_scheduled_maintenance
+
+        # Maintenance batches can take minutes; the heartbeat keeps the claim
+        # alive with short CAS writes and detects disable/reschedule/delete.
+        heartbeat = _MaintenanceLeaseHeartbeat(run, revision)
+        heartbeat.start()
+        try:
+            try:
+                run_scheduled_maintenance()
+            except BaseException as exc:
+                CrawlScheduleRun.objects.filter(pk=run.pk, claim_token=run.claim_token).update(
+                    status=CrawlScheduleRun.StatusChoices.FAILED,
+                    claim_until=timezone.now(),
+                    finished_at=timezone.now(),
+                    error=f"{type(exc).__name__}: {exc}"[:1000],
+                )
+                raise
+            now = timezone.now()
+            confirmed = CrawlScheduleRun.objects.filter(
+                pk=run.pk,
+                claim_token=run.claim_token,
+                schedule__is_enabled=True,
+                schedule__modified_at=revision,
+            ).update(
+                status=CrawlScheduleRun.StatusChoices.SUCCEEDED,
+                finished_at=now,
+                claim_until=now,
+                error="",
+            )
+            if confirmed == 1:
+                run.refresh_from_db()
+                return ScheduleDispatchResult(DISPATCH_DISPATCHED, run, None)
+            # Disabled, deleted or rescheduled while maintenance was running:
+            # this execution must not confirm as a run under the new config.
+            if heartbeat.guard_lost:
+                logger.warning(
+                    "Scheduled maintenance slot %s lost its lease guard mid-run; "
+                    "discarding the result so another owner can take over cleanly.",
+                    run.pk,
+                )
+            CrawlScheduleRun.objects.filter(pk=run.pk, claim_token=run.claim_token).update(
+                status=CrawlScheduleRun.StatusChoices.FAILED,
+                claim_until=now,
+                finished_at=now,
+                error="schedule was disabled, deleted or rescheduled while maintenance was running",
+            )
+            return ScheduleDispatchResult(DISPATCH_SKIPPED, None, None)
+        finally:
+            heartbeat.stop()
+
+    def _create_crawl_for_run(self, run: "CrawlScheduleRun", queued_at=None) -> "Crawl":
+        queued_at = queued_at or timezone.now()
+        template = self.template
+        label = template.label or self.label
+        crawl_config = {key: value for key, value in (self.config or {}).items() if key != "SCHEDULE_KIND"}
+
+        return Crawl.objects.create(
+            urls=template.urls,
+            config=crawl_config,
+            max_depth=template.max_depth,
+            tags_str=template.tags_str,
+            persona_id=template.persona_id,
+            label=label,
+            notes=template.notes,
+            schedule=self,
+            schedule_run=run,
+            status=Crawl.StatusChoices.QUEUED,
+            retry_at=queued_at,
+            created_by=template.created_by,
+        )
 
     def enqueue(self, queued_at=None) -> "Crawl":
+        """Materialize one Crawl outside any schedule slot (manual/legacy use)."""
         queued_at = queued_at or timezone.now()
         template = self.template
         label = template.label or self.label
@@ -142,6 +374,61 @@ class CrawlSchedule(ModelWithUUID, ModelWithNotes):
             retry_at=queued_at,
             created_by=template.created_by,
         )
+
+
+class _MaintenanceLeaseHeartbeat:
+    """Renews a maintenance slot lease on a daemon thread until ``stop()``.
+
+    Each renewal is one short compare-and-set write guarded by the claim
+    token, enabled flag and the schedule revision captured at claim time. If
+    the guard stops matching, ``guard_lost`` flips; maintenance itself runs to
+    completion (it is not safely interruptible), but its result can never be
+    confirmed by this owner.
+    """
+
+    def __init__(self, run: "CrawlScheduleRun", revision, *, interval: int = SCHEDULE_RUN_HEARTBEAT_SECONDS):
+        self._run_id = run.pk
+        self._token = run.claim_token
+        self._revision = revision
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.guard_lost = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._beat, name="schedule-run-lease-heartbeat", daemon=True)
+        self._thread.start()
+
+    def _beat(self) -> None:
+        from django.db import connections
+
+        try:
+            while not self._stop.wait(self._interval):
+                now = timezone.now()
+                try:
+                    renewed = CrawlScheduleRun.objects.filter(
+                        pk=self._run_id,
+                        claim_token=self._token,
+                        schedule__is_enabled=True,
+                        schedule__modified_at=self._revision,
+                    ).update(claim_until=now + timedelta(seconds=SCHEDULE_RUN_LEASE_SECONDS))
+                except OperationalError:
+                    # A transient writer/connection hiccup must not silently
+                    # end renewals: retry on the next beat. A schedule change
+                    # or a stolen lease still surfaces as renewed == 0.
+                    continue
+                if renewed != 1:
+                    self.guard_lost = True
+                    return
+        finally:
+            # This thread owns its own Django DB connection; never leave it
+            # open against the SQLite file after maintenance finishes.
+            connections.close_all()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
 
 
 class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWithHealthStats, ModelWithQueue):
@@ -174,6 +461,16 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
     label = models.CharField(max_length=64, blank=True, null=False, default="")
     notes = models.TextField(blank=True, null=False, default="")
     schedule = models.ForeignKey(CrawlSchedule, on_delete=models.SET_NULL, null=True, blank=True, editable=True)
+    # The concrete cron slot run that materialized this Crawl. At most one
+    # Crawl may exist per claimed schedule slot; NULL for historical Crawls
+    # created before slot claims existed.
+    schedule_run = models.OneToOneField(
+        "CrawlScheduleRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="crawl",
+    )
 
     status = ModelWithQueue.StatusField(
         choices=ModelWithQueue.StatusChoices,
@@ -1341,3 +1638,133 @@ class Crawl(ModelWithDeleteAfter, ModelWithOutputDir, ModelWithConfig, ModelWith
         persona = self.resolve_persona()
         if persona:
             persona.cleanup_runtime_for_crawl(self)
+
+
+class CrawlScheduleRun(ModelWithUUID):
+    """One durable execution claim for one concrete cron slot of a CrawlSchedule.
+
+    At most one row may exist per (schedule, slot_at). Every dispatcher (the
+    ``schedule --run-all`` CLI and the background daemon poll) claims the slot
+    row with a compare-and-set lease before doing any work, and exactly one
+    owner can confirm the slot succeeded. A stale ``claimed`` row whose lease
+    expired identifies a dead owner and is safely taken over by the next pass.
+    """
+
+    class StatusChoices(models.TextChoices):
+        CLAIMED = "claimed", "Claimed"
+        SUCCEEDED = "succeeded", "Succeeded"
+        FAILED = "failed", "Failed"
+
+    schedule = models.ForeignKey(
+        CrawlSchedule,
+        on_delete=models.CASCADE,
+        related_name="runs",
+        null=False,
+        blank=False,
+    )
+    slot_at = models.DateTimeField(null=False, blank=False, db_index=True)
+    status = models.CharField(
+        max_length=15,
+        choices=StatusChoices.choices,
+        default=StatusChoices.CLAIMED,
+        null=False,
+        blank=False,
+        db_index=True,
+    )
+    claim_token = models.CharField(max_length=64, null=False, blank=False, default="")
+    claimed_at = models.DateTimeField(default=timezone.now, null=False, blank=False)
+    claim_until = models.DateTimeField(null=False, blank=False, db_index=True)
+    claimed_by = models.CharField(max_length=255, null=False, blank=False, default="")
+    attempts = models.PositiveSmallIntegerField(default=1, null=False)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(null=False, blank=True, default="")
+
+    crawl: "Crawl | None"
+
+    class Meta(ModelWithUUID.Meta):
+        app_label = "crawls"
+        verbose_name = "Scheduled Crawl Run"
+        verbose_name_plural = "Scheduled Crawl Runs"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["schedule", "slot_at"],
+                name="crawlschedule_run_unique_slot",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["status", "claim_until"], name="crawlschedule_run_claim_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"[{self.schedule_id}] slot={self.slot_at:%Y-%m-%d %H:%M} {self.status}"
+
+    @property
+    def lease_is_active(self) -> bool:
+        return self.status == self.StatusChoices.CLAIMED and self.claim_until > timezone.now()
+
+    @classmethod
+    def claim_slot(cls, schedule, slot_at, *, now):
+        """Win the durable execution right for one ``(schedule, slot_at)``.
+
+        Compare-and-set against the unique slot row, without row locks:
+
+        - no row yet  -> insert one ``claimed`` row with a fresh token/lease;
+        - ``succeeded`` -> another owner already finished, skip;
+        - ``claimed`` with an unexpired lease -> another owner is alive, skip;
+        - expired ``claimed``/``failed`` -> one conditional UPDATE takes the
+          row over (attempts + 1). Zero rows updated means the race was lost.
+
+        Returns ``(run, schedule_revision)`` for the winner, else ``None``.
+        The revision (the schedule's ``modified_at``) guards the owner's final
+        commit so stale owners can never publish under a changed schedule.
+        """
+        state = CrawlSchedule.objects.filter(pk=schedule.pk).values("is_enabled", "modified_at").first()
+        if state is None or not state["is_enabled"]:
+            return None
+        revision = state["modified_at"]
+        token = uuid.uuid4().hex
+        lease_until = now + timedelta(seconds=SCHEDULE_RUN_LEASE_SECONDS)
+        owner = _current_claim_owner()
+
+        try:
+            with transaction.atomic():
+                run = cls.objects.create(
+                    schedule_id=schedule.pk,
+                    slot_at=slot_at,
+                    status=cls.StatusChoices.CLAIMED,
+                    claim_token=token,
+                    claimed_at=now,
+                    claim_until=lease_until,
+                    claimed_by=owner,
+                    attempts=1,
+                )
+            return run, revision
+        except IntegrityError:
+            # Another process inserted the same slot concurrently (or a row
+            # already exists from an earlier attempt); fall through to CAS.
+            pass
+
+        existing = cls.objects.filter(schedule_id=schedule.pk, slot_at=slot_at).first()
+        if existing is None or existing.status == cls.StatusChoices.SUCCEEDED:
+            return None
+        if existing.status == cls.StatusChoices.CLAIMED and existing.claim_until > now:
+            return None
+        took_over = cls.objects.filter(
+            pk=existing.pk,
+            status__in=(cls.StatusChoices.CLAIMED, cls.StatusChoices.FAILED),
+            claim_until__lte=now,
+        ).update(
+            status=cls.StatusChoices.CLAIMED,
+            claim_token=token,
+            claimed_at=now,
+            claim_until=lease_until,
+            claimed_by=owner,
+            attempts=F("attempts") + 1,
+            error="",
+            finished_at=None,
+        )
+        if took_over != 1:
+            return None
+        existing.refresh_from_db()
+        return existing, revision
+

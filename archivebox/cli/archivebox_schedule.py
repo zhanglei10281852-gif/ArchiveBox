@@ -42,7 +42,9 @@ def schedule(
     }
 
     def _active_schedules():
-        return CrawlSchedule.objects.filter(is_enabled=True).select_related("template").order_by("created_at")
+        return CrawlSchedule.with_run_state(
+            CrawlSchedule.objects.filter(is_enabled=True).select_related("template").order_by("created_at"),
+        )
 
     if clear:
         disabled_count = CrawlSchedule.objects.filter(is_enabled=True).update(
@@ -123,10 +125,16 @@ def schedule(
         maintained = 0
         now = timezone.now()
         for scheduled_crawl in schedules:
-            if scheduled_crawl.dispatch(queued_at=now) is None:
-                maintained += 1
-            else:
+            # force=True shares the exact durable slot claim the daemon uses;
+            # a slot that already succeeded (e.g. a concurrent run-all) is
+            # skipped instead of dispatching a second identical job.
+            outcome = scheduled_crawl.dispatch_due(now, force=True)
+            if not outcome.dispatched:
+                continue
+            if outcome.crawl is not None:
                 enqueued += 1
+            else:
+                maintained += 1
         result["run_all_enqueued"] = enqueued
         result["run_all_maintained"] = maintained
         print(f"[green]\\[*] Enqueued {enqueued} scheduled crawl(s) immediately.[/green]")

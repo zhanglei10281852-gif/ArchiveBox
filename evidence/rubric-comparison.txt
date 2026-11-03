@@ -1,0 +1,10 @@
+archivebox-archivebox-877c23c8-81b7-497f-a803-39b8d4619116｜让每个定时归档周期只产生一次有效派发
+完成度：部分完成｜有效轮数：276｜Harness：Trae｜Session：6ae9bd372341cef17663d53a｜时长：14460 秒｜超过两小时：是
+Rubric ID：1｜状态：通过｜期望行为：并发 daemon 对同一槽仅一方派发。｜实际观察：slot 唯一约束与令牌租约 CAS 使普通归档和维护各仅一个执行者成功。｜直接证据：models.py:1643-1769；并发用例通过；核心测试 13 passed。
+Rubric ID：2｜状态：通过｜期望行为：--run-all 与 daemon 共用协议且计数准确。｜实际观察：两入口均调用 dispatch_due，仅 dispatched 增加计数，成功槽和活动租约槽返回 skipped。｜直接证据：archivebox_schedule.py:123-143；runner.py:2318-2327；并发后 Enqueued 0。
+Rubric ID：3｜状态：通过｜期望行为：普通 Crawl 关联周期且接管不重复物化。｜实际观察：schedule_run 一对一，物化与确认同事务，接管复用孤儿 Crawl。｜直接证据：models.py:241-283、336-355、463-473；过期接管与孤儿用例通过。
+Rubric ID：4｜状态：未通过｜期望行为：维护失败可重试，成功确认后重启不重复。｜实际观察：维护先完成文件系统与搜索副作用，随后才写 succeeded；确认前退出使槽保持 claimed，租约过期后再次执行。｜直接证据：archivebox_update.py:131-146；models.py:285-317、1706-1769。｜原因：维护副作用完成后、成功确认提交前进程退出时，租约接管会再次执行同一槽维护｜影响：同一槽的迁移或重建执行第二次。｜证据位置：models.py:294 执行维护，303-314 确认，1752-1765 接管。
+Rubric ID：5｜状态：未通过｜期望行为：禁用、删除或改期后旧领取不能提交。｜实际观察：普通归档在事务内检查配置；维护在配置变化后继续完成副作用，仅在最终确认时失败。｜直接证据：models.py:241-277、285-332；禁用和改期用例通过。｜原因：维护在计划禁用删除或改期后仍继续执行副作用，仅在执行完成后拒绝成功确认｜影响：旧领取仍修改文件系统和搜索索引，failed 状态不能撤销副作用。｜证据位置：models.py:294 无执行前守卫，304-331 执行后检查修订。
+Rubric ID：6｜状态：通过｜期望行为：单实例 daemon 保持 cron 与 Crawl 生命周期。｜实际观察：daemon 经 dispatch_due 创建 queued Crawl 并进入原 runner，维护成功返回 dispatched。｜直接证据：runner.py:2318-2342；models.py:204-230、336-355；核心测试 13 passed。
+Rubric ID：7｜状态：通过｜期望行为：CLI、管理页和旧数据迁移兼容。｜实际观察：仅新增运行表和可空 schedule_run；CLI、管理页、API 与配置回归通过。｜直接证据：0020_schedule_run_claims.py:18-55；archivebox_schedule.py:44-166；12 passed, 2 deselected。
+关键验证：test_schedule_claims.py → 13 passed in 215.42s｜确定性兼容回归 → 12 passed, 2 deselected in 289.79s｜真实抓取用例环境超时未用于判定｜Realtime created→completed 14460 秒。

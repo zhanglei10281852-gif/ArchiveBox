@@ -2317,9 +2317,14 @@ def run_pending_crawls(
 
         if daemon and crawl_id is None:
             now = timezone.now()
-            for schedule in CrawlSchedule.objects.filter(is_enabled=True).select_related("template", "template__created_by"):
-                if schedule.is_due(now):
-                    schedule.dispatch(queued_at=now)
+            # The same durable slot claim used by `schedule --run-all`; due
+            # detection and takeover happen inside dispatch_due so two
+            # orchestrators can never dispatch one slot twice.
+            due_schedules = CrawlSchedule.with_run_state(
+                CrawlSchedule.objects.filter(is_enabled=True).select_related("template", "template__created_by"),
+            )
+            for schedule in due_schedules:
+                schedule.dispatch_due(now, force=False)
 
         if maintenance_only:
             # Filesystem migration is independent of lifecycle status; do not
